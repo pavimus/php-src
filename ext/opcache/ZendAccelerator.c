@@ -344,7 +344,7 @@ static MUTEX_T accel_zts_readers_mutex = NULL;
 static zend_atomic_int accel_zts_readers;
 static time_t accel_zts_next_warning;
 
-static bool accel_zts_lock_reader_byte(int type)
+static bool accel_zts_lock_reader_byte(int cmd, int type)
 {
 	struct flock lock;
 
@@ -353,19 +353,19 @@ static bool accel_zts_lock_reader_byte(int type)
 	lock.l_start = 1;
 	lock.l_len = 1;
 
-	return fcntl(lock_file, F_SETLK, &lock) != -1;
+	return fcntl(lock_file, cmd, &lock) != -1;
 }
 
-/* Must only be called from RINIT; on success the caller sets ZCG(counted) */
-static bool accel_zts_reader_enter(void)
+/* Adds (+1, only from RINIT) or releases (-1) a reference of the calling thread.
+ * Does not use ZCG() as it is also called from accel_globals_dtor(). */
+static bool accel_zts_readers_add(int delta)
 {
 	int count;
 
 #ifndef HAVE_NO_ATOMICS
-	/* the process already holds the reader lock: only a positive count may grow */
 	count = zend_atomic_int_load_ex(&accel_zts_readers);
-	while (count > 0) {
-		if (zend_atomic_int_compare_exchange_ex(&accel_zts_readers, &count, count + 1)) {
+	while (count > 0 && count + delta > 0) {
+		if (zend_atomic_int_compare_exchange_ex(&accel_zts_readers, &count, count + delta)) {
 			return true;
 		}
 	}
@@ -373,39 +373,19 @@ static bool accel_zts_reader_enter(void)
 
 	tsrm_mutex_lock(accel_zts_readers_mutex);
 	count = zend_atomic_int_load_ex(&accel_zts_readers);
-	/* fails while another process restarts the cache (it holds the write lock) */
-	if (count == 0 && !accel_zts_lock_reader_byte(F_RDLCK)) {
+	/* waits while another process restarts the cache (it holds the write lock) */
+	if (count == 0 && !accel_zts_lock_reader_byte(F_SETLKW, F_RDLCK)) {
 		zend_accel_error(ACCEL_LOG_DEBUG, "UpdateC(+1):  %s (%d)", strerror(errno), errno);
 		tsrm_mutex_unlock(accel_zts_readers_mutex);
 		return false;
 	}
-	while (!zend_atomic_int_compare_exchange_ex(&accel_zts_readers, &count, count + 1));
+	while (!zend_atomic_int_compare_exchange_ex(&accel_zts_readers, &count, count + delta));
+	if (count + delta == 0) {
+		/* the last reader of this process; unlock before another thread may relock */
+		accel_zts_lock_reader_byte(F_SETLK, F_UNLCK);
+	}
 	tsrm_mutex_unlock(accel_zts_readers_mutex);
 	return true;
-}
-
-/* Releases one reference; does not use ZCG() as it is also called from accel_globals_dtor() */
-static void accel_zts_reader_leave(void)
-{
-	int count;
-
-#ifndef HAVE_NO_ATOMICS
-	count = zend_atomic_int_load_ex(&accel_zts_readers);
-	while (count > 1) {
-		if (zend_atomic_int_compare_exchange_ex(&accel_zts_readers, &count, count - 1)) {
-			return;
-		}
-	}
-#endif
-
-	tsrm_mutex_lock(accel_zts_readers_mutex);
-	count = zend_atomic_int_load_ex(&accel_zts_readers);
-	while (!zend_atomic_int_compare_exchange_ex(&accel_zts_readers, &count, count - 1));
-	if (count == 1) {
-		/* the last reader of this process; unlock before another thread may relock */
-		accel_zts_lock_reader_byte(F_UNLCK);
-	}
-	tsrm_mutex_unlock(accel_zts_readers_mutex);
 }
 #endif
 
@@ -417,7 +397,7 @@ static inline zend_result accel_activate_add(void)
 	INCREMENT(mem_usage);
 	SHM_PROTECT();
 #elif defined(ZTS)
-	/* A thread becomes a reader only in RINIT, see accel_zts_reader_enter(). A request
+	/* A thread becomes a reader only in RINIT, see accel_zts_readers_add(). A request
 	 * that was not admitted there must not start to use SHM later. */
 	return FAILURE;
 #else
@@ -471,7 +451,7 @@ static inline void accel_unlock_all(void)
 	 * belong to the process, and the SHM write lock (byte 0) and the restart lock
 	 * (byte 2) may be held by other threads. */
 	if (ZCG(counted)) {
-		accel_zts_reader_leave();
+		accel_zts_readers_add(-1);
 	}
 #else
 	if (lock_file == -1) {
@@ -1032,32 +1012,34 @@ static inline bool accel_is_inactive(void)
 static bool accel_zts_restart_begin(void)
 {
 	int readers;
+	time_t now;
 
 	tsrm_mutex_lock(accel_zts_readers_mutex);
 	readers = zend_atomic_int_load_ex(&accel_zts_readers);
-	if (readers == 0 && accel_zts_lock_reader_byte(F_WRLCK)) {
+	if (readers == 0 && accel_zts_lock_reader_byte(F_SETLK, F_WRLCK)) {
 		return true;
 	}
 	tsrm_mutex_unlock(accel_zts_readers_mutex);
 
+	now = time(NULL);
 	if (readers == 0) {
-		/* readers in other processes: keep the force_restart_timeout handling */
+		/* readers in other processes: as without ZTS, force_restart_timeout kills them,
+		 * here with all their threads */
 		(void) accel_is_inactive();
-	} else if (ZCG(accel_directives).force_restart_timeout
-			&& ZCSG(force_restart_time)
-			&& time(NULL) >= ZCSG(force_restart_time)
-			&& time(NULL) >= accel_zts_next_warning) {
-		/* threads cannot be killed, and this process must not kill itself */
+	} else if (ZCG(accel_directives).force_restart_timeout && ZCSG(force_restart_time)
+			&& now >= ZCSG(force_restart_time) && now >= accel_zts_next_warning) {
+		/* Threads cannot be killed and this process must not kill itself: the restart
+		 * waits for the running requests, new ones run uncached meanwhile */
 		zend_accel_error(ACCEL_LOG_WARNING, "Restart delayed for %ld seconds by %d threads of process %d still using the cache",
-			(long)(time(NULL) - ZCSG(force_restart_time) + ZCG(accel_directives).force_restart_timeout), readers, getpid());
-		accel_zts_next_warning = time(NULL) + ZCG(accel_directives).force_restart_timeout;
+			(long)(now - ZCSG(force_restart_time) + ZCG(accel_directives).force_restart_timeout), readers, getpid());
+		accel_zts_next_warning = now + ZCG(accel_directives).force_restart_timeout;
 	}
 	return false;
 }
 
 static void accel_zts_restart_end(void)
 {
-	accel_zts_lock_reader_byte(F_UNLCK);
+	accel_zts_lock_reader_byte(F_SETLK, F_UNLCK);
 	accel_zts_next_warning = 0;
 	tsrm_mutex_unlock(accel_zts_readers_mutex);
 }
@@ -2886,7 +2868,7 @@ ZEND_RINIT_FUNCTION(zend_accelerator)
 #if defined(ZTS) && !defined(ZEND_WIN32)
 	/* Under ZTS this is the only place where a request starts to use SHM */
 	if (ZCG(accelerator_enabled)) {
-		if (accel_zts_reader_enter()) {
+		if (accel_zts_readers_add(1)) {
 			ZCG(counted) = true;
 			/* SHM-backed keys may be added to the PCRE cache again */
 			ZCG(pcre_reseted) = false;
@@ -3127,7 +3109,7 @@ static void accel_globals_dtor(zend_accel_globals *accel_globals)
 	 * all threads from the current one. */
 	if (accel_globals->counted && accel_zts_readers_mutex) {
 		accel_globals->counted = false;
-		accel_zts_reader_leave();
+		accel_zts_readers_add(-1);
 	}
 #endif
 	zend_string_free(accel_globals->key);
